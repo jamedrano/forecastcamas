@@ -4,3 +4,4 @@ numpy
 scikit-learn
 lightgbm
 plotly
+matplotlib
