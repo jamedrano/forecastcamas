@@ -118,19 +118,19 @@ def generate_future_forecast(_final_model, _df_model_data, forecast_weeks, _feat
         future_step_df['fecha'] = date
         future_step_df = create_time_features_for_future(future_step_df)
         
-        # Merge with all of history to get the necessary data for feature calculation
-        # The column from history is 'cantidad_semanal', not 'cantidad_semanal_hist'
         temp_df = pd.merge(future_step_df[['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']], current_history, on=['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'], how='left')
         
         grouped = temp_df.groupby(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])
         
-        # *** FIX IS HERE: Use 'cantidad_semanal' as the column name ***
-        future_step_df['lag_1'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-1])
-        future_step_df['lag_2'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-2])
-        future_step_df['lag_4'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-4])
+        # *** FIX IS HERE: Add conditional length checks to prevent IndexError ***
+        future_step_df['lag_1'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-1] if len(x) >= 1 else np.nan)
+        future_step_df['lag_2'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-2] if len(x) >= 2 else np.nan)
+        future_step_df['lag_4'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-4] if len(x) >= 4 else np.nan)
         future_step_df['lag_52'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-52] if len(x) >= 52 else np.nan)
+        # The rolling mean is already robust to short series, so it does not need a check.
         future_step_df['rolling_mean_4'] = grouped['cantidad_semanal'].transform(lambda x: x.tail(4).mean())
         
+        # Fill any missing values (from short histories) with 0 before predicting
         future_step_df.fillna(0, inplace=True)
 
         predictions = _final_model.predict(future_step_df[_features])
@@ -163,6 +163,7 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
 
     with tab1:
         st.header("Exploratory Data Analysis")
+        #... (Tab 1 code is unchanged) ...
         st.subheader("Data Previews")
         col1, col2 = st.columns(2)
         with col1: st.write(f"**INGRESOS:** `{df_ingresos.shape[0]}` rows"); st.dataframe(df_ingresos.head())
@@ -175,7 +176,6 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
         if not selected_bodegas: st.warning("Please select at least one warehouse."); st.stop()
         filtered_demand = df_demand[df_demand['BODEGA_ORIGEN_DESC'].isin(selected_bodegas)]
         
-        # ... (rest of Tab 1 is unchanged but included for completeness) ...
         st.subheader("High-Level Metrics")
         total_quantity_sold=filtered_demand['CANTIDAD'].sum(); num_unique_skus=filtered_demand['SKU_ALTERNO'].nunique(); start_date=filtered_demand['GENERADA_EL_FECHA_HORA'].min().date(); end_date=filtered_demand['GENERADA_EL_FECHA_HORA'].max().date()
         kpi1, kpi2, kpi3 = st.columns(3); kpi1.metric("Total Quantity Sold", f"{int(total_quantity_sold):,}"); kpi2.metric("Unique SKUs Sold", f"{num_unique_skus:,}"); kpi3.metric("Date Range", f"{start_date} to {end_date}")
@@ -209,7 +209,6 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
             
             st.subheader("Model Feature Importance")
             fig_imp, ax_imp = plt.subplots(figsize=(10, 8))
-            # *** FIX IS HERE: Add hue='feature' and legend=False to resolve warning ***
             sns.barplot(x='importance', y='feature', data=st.session_state['feat_imp'].head(15), palette='viridis', ax=ax_imp, hue='feature', legend=False)
             ax_imp.set_title('Top 15 Most Important Features'); st.pyplot(fig_imp)
 
