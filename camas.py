@@ -1,201 +1,178 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
-import lightgbm as lgb
-import plotly.express as px
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # --- Page Configuration ---
+# Use the full screen width for a better dashboard experience
 st.set_page_config(
-    page_title="Pronóstico de Demanda",
-    page_icon="🛏️",
+    page_title="Demand Forecasting App",
     layout="wide"
 )
 
-# --- Caching Functions for Performance ---
-
+# --- Data Loading Function ---
+# Cache the data loading to improve performance. The data will only be reloaded
+# if the uploaded file's contents change.
 @st.cache_data
-def load_data(uploaded_file):
-    """Loads data from an uploaded file object with explicit date parsing."""
-    # Identify potential date columns for robust parsing
-    date_cols_egresos = ['GENERADA_EL_FECHA_HORA', 'FECHA_ENTREGA']
-    date_cols_ingresos = ['FechaEmision', 'RecibidaEl', 'TaxDate']
-    
-    df = pd.read_csv(uploaded_file)
-    
-    # Check which date columns exist and parse them
-    if all(col in df.columns for col in date_cols_egresos):
-        return pd.read_csv(uploaded_file, parse_dates=date_cols_egresos)
-    elif all(col in df.columns for col in date_cols_ingresos):
-        return pd.read_csv(uploaded_file, parse_dates=date_cols_ingresos)
-    else:
-        # Fallback for files with unexpected column names
-        return pd.read_csv(uploaded_file)
-
-
-@st.cache_data
-def preprocess_and_feature_engineer(_df_demand): # The underscore prevents streamlit from hashing the input df name
-    """Aggregates data weekly and creates all necessary features for the model."""
-    df_demand_filtered = _df_demand[
-        (_df_demand['TIPO_DESC'] == 'Egreso') &
-        (_df_demand['ESTADO_DESCRIP'] == 'Cerrada')
-    ].copy()
-
-    df_ts = df_demand_filtered[['GENERADA_EL_FECHA_HORA', 'BODEGA_ORIGEN_DESC', 'SKU_ALTERNO', 'CANTIDAD']].copy()
-    df_ts['fecha'] = pd.to_datetime(df_ts['GENERADA_EL_FECHA_HORA']).dt.normalize()
-
-    df_weekly = df_ts.set_index('fecha').groupby(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).resample('W-SUN')['CANTIDAD'].sum().reset_index()
-    df_weekly.rename(columns={'CANTIDAD': 'cantidad_semanal'}, inplace=True)
-
-    df_weekly['year'] = df_weekly['fecha'].dt.year
-    df_weekly['month'] = df_weekly['fecha'].dt.month
-    df_weekly['week_of_year'] = df_weekly['fecha'].dt.isocalendar().week.astype(int)
-    df_weekly['quarter'] = df_weekly['fecha'].dt.quarter
-
-    df_weekly.sort_values(by=['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO', 'fecha'], inplace=True)
-    grouped = df_weekly.groupby(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])['cantidad_semanal']
-    df_weekly['lag_1'] = grouped.shift(1)
-    df_weekly['lag_2'] = grouped.shift(2)
-    df_weekly['lag_4'] = grouped.shift(4)
-    df_weekly['lag_52'] = grouped.shift(52)
-    df_weekly['rolling_mean_4'] = grouped.transform(lambda x: x.rolling(window=4).mean())
-    
-    hierarchy_cols = ['SKU_ALTERNO', 'DESC_MARCA', 'TIPO_PRODUCTO', 'FAMILIA', 'SUB_FAMILIA']
-    sku_attributes = _df_demand[hierarchy_cols].drop_duplicates(subset=['SKU_ALTERNO'])
-    df_final_features = pd.merge(df_weekly, sku_attributes, on='SKU_ALTERNO', how='left')
-    
-    for col in ['DESC_MARCA', 'TIPO_PRODUCTO', 'FAMILIA', 'SUB_FAMILIA']:
-        df_final_features[col] = df_final_features[col].astype('category')
-        
-    return df_final_features
-
-@st.cache_resource
-def train_final_model(_df_features):
-    """Trains and returns the final LightGBM model on all available data."""
-    df_model_data = _df_features.dropna()
-    
-    FEATURES = ['year', 'month', 'week_of_year', 'quarter', 'lag_1', 'lag_2', 'lag_4', 'lag_52', 'rolling_mean_4', 'DESC_MARCA', 'TIPO_PRODUCTO', 'FAMILIA', 'SUB_FAMILIA']
-    CATEGORICAL_FEATURES = ['DESC_MARCA', 'TIPO_PRODUCTO', 'FAMILIA', 'SUB_FAMILIA']
-    TARGET = 'cantidad_semanal'
-    
-    X_full = df_model_data[FEATURES]
-    y_full = df_model_data[TARGET]
-
-    final_model = lgb.LGBMRegressor(n_estimators=61, learning_rate=0.05, random_state=42, n_jobs=-1)
-    final_model.fit(X_full, y_full, categorical_feature=CATEGORICAL_FEATURES)
-    return final_model
-
-def generate_forecast(_model, _historical_data, forecast_weeks):
-    """Generates a future forecast using an iterative approach."""
-    FEATURES = _model.feature_name_
-    CATEGORICAL_FEATURES = [col for col in FEATURES if _historical_data[col].dtype.name == 'category']
-
-    last_date = _historical_data['fecha'].max()
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_weeks, freq='W-SUN')
-    
-    current_history = _historical_data.sort_values('fecha').groupby('SKU_ALTERNO').tail(52)
-    future_df = pd.DataFrame()
-
-    for date in future_dates:
-        future_step = pd.DataFrame({'fecha': [date]})
-        future_step['year'], future_step['month'], future_step['week_of_year'], future_step['quarter'] = date.year, date.month, date.isocalendar().week, date.quarter
-        future_step['key'] = 1
-
-        unique_skus = current_history[['SKU_ALTERNO'] + CATEGORICAL_FEATURES].drop_duplicates()
-        unique_skus['key'] = 1
-        
-        future_step_df = pd.merge(unique_skus, future_step, on='key').drop('key', axis=1)
-        
-        sku_to_last_value = current_history.groupby('SKU_ALTERNO')['cantidad_semanal']
-        future_step_df['lag_1'] = future_step_df['SKU_ALTERNO'].map(sku_to_last_value.nth(-1))
-        future_step_df['lag_2'] = future_step_df['SKU_ALTERNO'].map(sku_to_last_value.nth(-2))
-        future_step_df['lag_4'] = future_step_df['SKU_ALTERNO'].map(sku_to_last_value.nth(-4))
-        future_step_df['lag_52'] = future_step_df['SKU_ALTERNO'].map(sku_to_last_value.nth(-52))
-        last_rolling_mean = sku_to_last_value.rolling(4).mean().groupby('SKU_ALTERNO').last()
-        future_step_df['rolling_mean_4'] = future_step_df['SKU_ALTERNO'].map(last_rolling_mean)
-
-        # --- FIX: Target only numeric feature columns for fillna ---
-        numeric_features_to_fill = ['lag_1', 'lag_2', 'lag_4', 'lag_52', 'rolling_mean_4']
-        future_step_df[numeric_features_to_fill] = future_step_df[numeric_features_to_fill].fillna(0)
-
-        predictions = _model.predict(future_step_df[FEATURES])
-        future_step_df['cantidad_semanal'] = np.maximum(0, predictions)
-
-        current_history = pd.concat([current_history, future_step_df])
-        future_df = pd.concat([future_df, future_step_df])
-        
-    return future_df
-
-# --- Main App ---
-st.title("🛏️ Prototipo de Pronóstico de Demanda")
-st.write("Esta aplicación utiliza un modelo de Machine Learning (LightGBM) para pronosticar la demanda semanal de camas y colchones.")
-
-st.sidebar.header("1. Cargar Archivos de Datos")
-uploaded_egresos_file = st.sidebar.file_uploader("Cargar archivo de EGRESOS (Requerido)", type="csv", help="Archivo de salidas de inventario (demanda histórica).")
-uploaded_ingresos_file = st.sidebar.file_uploader("Cargar archivo de INGRESOS (Opcional)", type="csv", help="Archivo de entradas de inventario para análisis adicional.")
-
-if uploaded_egresos_file is not None:
+def load_data(ingresos_upload, egresos_upload):
+    """
+    Loads the inflow and outflow datasets from user-uploaded files,
+    parsing date columns for proper handling.
+    """
     try:
-        df_demand_raw = load_data(uploaded_egresos_file)
-        df_history = preprocess_and_feature_engineer(df_demand_raw)
-        final_model = train_final_model(df_history)
+        # Load the Inflows (Receipts) dataset
+        df_ingresos = pd.read_csv(
+            ingresos_upload,
+            parse_dates=['FechaEmision', 'RecibidaEl', 'TaxDate']
+        )
 
-        st.sidebar.header("2. Configurar Pronóstico")
-        weeks_to_forecast = st.sidebar.slider("Semanas a Pronosticar", min_value=4, max_value=52, value=12, step=4)
-        
-        st.sidebar.header("3. Filtros de Visualización")
-        marcas = sorted(df_history['DESC_MARCA'].astype(str).unique().tolist())
-        familias = sorted(df_history['FAMILIA'].astype(str).unique().tolist())
-        selected_marcas = st.sidebar.multiselect("Filtrar por Marca", marcas, default=marcas)
-        selected_familias = st.sidebar.multiselect("Filtrar por Familia", familias, default=familias)
-
-        with st.spinner('Generando pronóstico...'):
-            forecast_df = generate_forecast(final_model, df_history, weeks_to_forecast)
-
-        if not selected_marcas: selected_marcas = marcas
-        if not selected_familias: selected_familias = familias
-
-        history_filtered = df_history[df_history['DESC_MARCA'].isin(selected_marcas) & df_history['FAMILIA'].isin(selected_familias)]
-        forecast_filtered = forecast_df[forecast_df['DESC_MARCA'].isin(selected_marcas) & forecast_df['FAMILIA'].isin(selected_familias)]
-
-        total_forecasted_units = forecast_filtered['cantidad_semanal'].sum()
-        st.header(f"Pronóstico para las próximas {weeks_to_forecast} semanas")
-        st.metric("Total de Unidades Pronosticadas (Filtro Actual)", f"{total_forecasted_units:,.0f}")
-
-        hist_agg = history_filtered.groupby('fecha')['cantidad_semanal'].sum().reset_index()
-        hist_agg['Tipo'] = 'Ventas Históricas'
-        forecast_agg = forecast_filtered.groupby('fecha')['cantidad_semanal'].sum().reset_index()
-        forecast_agg['Tipo'] = 'Pronóstico'
-        plot_df = pd.concat([hist_agg, forecast_agg])
-
-        fig = px.line(plot_df, x='fecha', y='cantidad_semanal', color='Tipo', title="Ventas Semanales: Histórico vs. Pronóstico", labels={'fecha': 'Semana', 'cantidad_semanal': 'Cantidad de Unidades'}, markers=True)
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("Ver datos detallados del pronóstico"):
-            display_df = forecast_filtered[['fecha', 'SKU_ALTERNO', 'DESC_MARCA', 'FAMILIA', 'cantidad_semanal']].rename(columns={'fecha': 'Semana', 'cantidad_semanal': 'Cantidad Pronosticada'}).sort_values(by=['Semana', 'SKU_ALTERNO'])
-            st.dataframe(display_df, use_container_width=True)
-            csv = display_df.to_csv(index=False).encode('utf-8')
-            st.download_button("Descargar Pronóstico como CSV", csv, f'pronostico_{weeks_to_forecast}_semanas.csv', 'text/csv')
-
+        # Load the Outflows (Shipments/Demand) dataset
+        df_egresos = pd.read_csv(
+            egresos_upload,
+            parse_dates=['GENERADA_EL_FECHA_HORA', 'FECHA_ENTREGA']
+        )
+        return df_ingresos, df_egresos
     except Exception as e:
-        st.error(f"Ocurrió un error al procesar el archivo de EGRESOS. Verifique que el formato y las columnas sean correctos.")
-        st.error(f"Detalle del error: {e}")
+        # If loading fails, show a user-friendly error in the app
+        st.error(f"Error loading data: {e}")
+        st.error("Please ensure the uploaded files are the correct CSVs with the expected columns.")
+        return None, None
 
-else:
-    st.info("👋 ¡Bienvenido! Por favor, cargue el archivo de **EGRESOS** para comenzar a generar el pronóstico.")
+# --- Sidebar for File Uploads ---
+with st.sidebar:
+    st.header("1. Upload Data")
+    st.markdown("""
+    Please upload the two required CSV files:
+    - **Ingresos:** `INGRESO_INV_CAMASYCOLCHONES.CSV`
+    - **Egresos:** `EGRESO_INV_BODEGA_CAMASYCOLCHONES.CSV`
+    """)
 
-if uploaded_ingresos_file is not None:
-    with st.expander("Análisis Exploratorio del Archivo de Ingresos"):
-        try:
-            st.info("Nota: Este archivo no se usa en el modelo de pronóstico, pero se muestra para análisis de contexto.")
-            df_ingresos = load_data(uploaded_ingresos_file)
-            st.subheader("Vista Previa de los Datos de Ingresos")
-            st.dataframe(df_ingresos.head())
+    # Create two file uploader widgets
+    uploaded_ingresos_file = st.file_uploader(
+        "Upload the INGRESOS file",
+        type=['csv']
+    )
+    uploaded_egresos_file = st.file_uploader(
+        "Upload the EGRESOS file",
+        type=['csv']
+    )
 
-            st.subheader("Top 10 Proveedores por Volumen de Recepciones")
-            if 'Proveedor' in df_ingresos.columns:
-                proveedor_counts = df_ingresos['Proveedor'].value_counts().nlargest(10)
-                st.bar_chart(proveedor_counts)
-            else:
-                st.warning("No se encontró la columna 'Proveedor' en el archivo de ingresos.")
-        except Exception as e:
-            st.error(f"No se pudo procesar el archivo de INGRESOS. Verifique el formato. Error: {e}")
+# --- Main App Interface ---
+st.title("📦 Demand Forecasting for Beds & Mattresses")
+st.markdown("""
+This application provides a comprehensive analysis and forecast of product demand.
+**To begin, please upload your data files using the sidebar on the left.**
+""")
+
+# --- Create Tabs ---
+tab1, tab2 = st.tabs(["📊 Exploratory Data Analysis", "📈 Model & Forecast (Coming Soon)"])
+
+# --- Module 1: Exploratory Data Analysis ---
+with tab1:
+    st.header("Exploratory Data Analysis")
+
+    # Check if both files have been uploaded before proceeding
+    if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
+        # Load data and show a spinner while loading
+        with st.spinner('Processing uploaded data... Please wait.'):
+            df_ingresos, df_egresos = load_data(uploaded_ingresos_file, uploaded_egresos_file)
+
+        # Check if data was loaded successfully before proceeding
+        if df_ingresos is not None and df_egresos is not None:
+            st.success("Data loaded successfully!")
+
+            # --- Display Raw Data Previews ---
+            st.subheader("Data Previews")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**INGRESOS (Inflows):** `{df_ingresos.shape[0]}` rows, `{df_ingresos.shape[1]}` columns.")
+                st.dataframe(df_ingresos.head())
+            with col2:
+                st.write(f"**EGRESOS (Outflows):** `{df_egresos.shape[0]}` rows, `{df_egresos.shape[1]}` columns.")
+                st.dataframe(df_egresos.head())
+
+            # --- Data Pre-processing for Analysis ---
+            df_demand = df_egresos[
+                (df_egresos['TIPO_DESC'] == 'Egreso') &
+                (df_egresos['ESTADO_DESCRIP'] == 'Cerrada')
+            ].copy()
+
+            # --- Sidebar Filters (appear after data is loaded) ---
+            st.sidebar.divider()
+            st.sidebar.header("2. Dashboard Filters")
+            st.sidebar.markdown("Use these filters to explore the data.")
+
+            all_bodegas = sorted(df_demand['BODEGA_ORIGEN_DESC'].unique())
+            selected_bodegas = st.sidebar.multiselect(
+                'Select Warehouse(s)',
+                options=all_bodegas,
+                default=all_bodegas
+            )
+
+            if not selected_bodegas:
+                st.warning("Please select at least one warehouse to see the analysis.")
+                st.stop()
+
+            filtered_demand = df_demand[df_demand['BODEGA_ORIGEN_DESC'].isin(selected_bodegas)]
+
+            # --- Display Key Performance Indicators (KPIs) ---
+            st.subheader("High-Level Metrics")
+            st.markdown(f"Metrics below are based on the selected warehouse(s): **{', '.join(selected_bodegas)}**")
+
+            total_quantity_sold = filtered_demand['CANTIDAD'].sum()
+            num_unique_skus = filtered_demand['SKU_ALTERNO'].nunique()
+            num_transactions = len(filtered_demand)
+            start_date = filtered_demand['GENERADA_EL_FECHA_HORA'].min().date()
+            end_date = filtered_demand['GENERADA_EL_FECHA_HORA'].max().date()
+
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            kpi1.metric("Total Quantity Sold", f"{int(total_quantity_sold):,}")
+            kpi2.metric("Unique SKUs Sold", f"{num_unique_skus:,}")
+            kpi3.metric("Total Transactions", f"{num_transactions:,}")
+            kpi4.metric("Date Range", f"{start_date} to {end_date}")
+
+            # --- Data Visualizations ---
+            st.subheader("Demand Analysis Visualizations")
+            sns.set_style("whitegrid")
+
+            # 1. Total Weekly Demand Plot
+            st.markdown("#### Total Weekly Demand Over Time")
+            weekly_demand = filtered_demand.set_index('GENERADA_EL_FECHA_HORA').resample('W')['CANTIDAD'].sum()
+            fig1, ax1 = plt.subplots(figsize=(12, 5))
+            sns.lineplot(data=weekly_demand, ax=ax1, lw=2)
+            ax1.set_title("Total Weekly Demand", fontsize=16)
+            ax1.set_ylabel("Total Quantity Sold")
+            ax1.set_xlabel("Date")
+            st.pyplot(fig1)
+
+            # 2. Top N Charts
+            col_viz1, col_viz2 = st.columns(2)
+            with col_viz1:
+                st.markdown("#### Top 10 Selling Products (SKU)")
+                top_10_skus = filtered_demand.groupby('SKU_ALTERNO')['CANTIDAD'].sum().nlargest(10)
+                fig2, ax2 = plt.subplots(figsize=(8, 6))
+                sns.barplot(y=top_10_skus.index, x=top_10_skus.values, ax=ax2, palette="viridis")
+                ax2.set_title("Top 10 SKUs by Quantity Sold")
+                ax2.set_xlabel("Total Quantity Sold")
+                ax2.set_ylabel("SKU Alterno")
+                st.pyplot(fig2)
+
+            with col_viz2:
+                st.markdown("#### Top 10 Selling Brands")
+                top_10_brands = filtered_demand.groupby('DESC_MARCA')['CANTIDAD'].sum().nlargest(10)
+                fig3, ax3 = plt.subplots(figsize=(8, 6))
+                sns.barplot(y=top_10_brands.index, x=top_10_brands.values, ax=ax3, palette="plasma")
+                ax3.set_title("Top 10 Brands by Quantity Sold")
+                ax3.set_xlabel("Total Quantity Sold")
+                ax3.set_ylabel("Brand")
+                st.pyplot(fig3)
+
+    else:
+        # Show a prompt if files are not yet uploaded
+        st.info("Awaiting CSV file uploads. Please use the sidebar to upload your data.")
+        st.image("https://i.imgur.com/3Z6kH2g.png", width=200) # Simple arrow pointing left
+
+# Placeholder for the next module
+with tab2:
+    st.header("Model Training and Forecasting")
+    st.info("This section is under construction. Please upload data first to enable forecasting.")
