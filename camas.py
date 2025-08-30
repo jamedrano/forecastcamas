@@ -102,43 +102,52 @@ def create_time_features_for_future(df):
     df_out['quarter'] = df_out['fecha'].dt.quarter
     return df_out
 
+# *** FIX IS HERE: This is the new, high-performance function ***
 @st.cache_data
 def generate_future_forecast(_final_model, _df_model_data, forecast_weeks, _features, _categorical_features):
-    """Generates an iterative, auto-regressive forecast for future weeks."""
-    last_date = _df_model_data['fecha'].max()
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(weeks=1), periods=forecast_weeks, freq='W')
+    """Generates an efficient, iterative forecast using lookups instead of merges."""
     
-    identifiers = _df_model_data[['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'] + _categorical_features].drop_duplicates()
+    # Use a multi-index for fast lookups
+    history = _df_model_data.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])
     
-    current_history = _df_model_data.copy()
+    # Get unique identifiers for which to generate forecasts
+    identifiers = history.index.unique()
+    
     future_df_list = []
-
-    for date in future_dates:
-        future_step_df = identifiers.copy()
+    
+    for date in pd.date_range(start=history['fecha'].max() + pd.Timedelta(weeks=1), periods=forecast_weeks, freq='W'):
+        # Prepare the DataFrame for the current future week
+        future_step_df = pd.DataFrame(index=identifiers).reset_index()
         future_step_df['fecha'] = date
+        
+        # Create time-based features
         future_step_df = create_time_features_for_future(future_step_df)
         
-        temp_df = pd.merge(future_step_df[['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']], current_history, on=['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'], how='left')
-        
-        grouped = temp_df.groupby(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])
-        
-        # *** FIX IS HERE: Add conditional length checks to prevent IndexError ***
-        future_step_df['lag_1'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-1] if len(x) >= 1 else np.nan)
-        future_step_df['lag_2'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-2] if len(x) >= 2 else np.nan)
-        future_step_df['lag_4'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-4] if len(x) >= 4 else np.nan)
-        future_step_df['lag_52'] = grouped['cantidad_semanal'].transform(lambda x: x.iloc[-52] if len(x) >= 52 else np.nan)
-        # The rolling mean is already robust to short series, so it does not need a check.
-        future_step_df['rolling_mean_4'] = grouped['cantidad_semanal'].transform(lambda x: x.tail(4).mean())
-        
-        # Fill any missing values (from short histories) with 0 before predicting
-        future_step_df.fillna(0, inplace=True)
+        # Add static categorical features
+        static_features = history[_categorical_features].groupby(level=[0, 1]).first()
+        future_step_df = future_step_df.merge(static_features, left_on=['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'], right_index=True)
 
+        # --- Efficient Feature Calculation using GroupBy and direct lookups ---
+        grouped_history = history.groupby(level=[0, 1])['cantidad_semanal']
+
+        future_step_df['lag_1'] = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index.map(grouped_history.last())
+        future_step_df['lag_2'] = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index.map(grouped_history.nth(-2))
+        future_step_df['lag_4'] = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index.map(grouped_history.nth(-4))
+        future_step_df['lag_52'] = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index.map(grouped_history.nth(-52))
+        future_step_df['rolling_mean_4'] = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index.map(grouped_history.rolling(4).mean().groupby(level=[0, 1]).last())
+
+        future_step_df.fillna(0, inplace=True)
+        
+        # Predict and store
         predictions = _final_model.predict(future_step_df[_features])
         future_step_df['cantidad_semanal'] = np.maximum(0, predictions)
-
-        current_history = pd.concat([current_history, future_step_df[['fecha', 'BODEGA_ORIGEN_DESC', 'SKU_ALTERNO', 'cantidad_semanal'] + _categorical_features]])
+        
+        # Append the new prediction to history for the next iteration
+        new_history_row = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])
+        history = pd.concat([history, new_history_row])
+        
         future_df_list.append(future_step_df)
-    
+        
     return pd.concat(future_df_list)
 
 @st.cache_data
@@ -153,6 +162,7 @@ with st.sidebar:
     uploaded_egresos_file = st.file_uploader("Upload EGRESOS", type=['csv'])
 
 # --- Main App Interface ---
+# (The rest of the app's code is unchanged, as the fix was in the helper function)
 st.title("📦 Demand Forecasting for Beds & Mattresses")
 
 if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
@@ -163,7 +173,6 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
 
     with tab1:
         st.header("Exploratory Data Analysis")
-        #... (Tab 1 code is unchanged) ...
         st.subheader("Data Previews")
         col1, col2 = st.columns(2)
         with col1: st.write(f"**INGRESOS:** `{df_ingresos.shape[0]}` rows"); st.dataframe(df_ingresos.head())
