@@ -13,9 +13,6 @@ st.set_page_config(
 )
 
 # --- Helper Functions (with Caching for performance) ---
-# NOTE: The helper functions (load_data, create_features, etc.) remain unchanged
-# as the new logic will be applied in the main app interface before calling them.
-# I am including them here for completeness.
 
 @st.cache_data
 def load_data(ingresos_upload, egresos_upload):
@@ -120,7 +117,6 @@ def generate_future_forecast(_final_model, _df_model_data, forecast_weeks, _feat
         future_step_df = future_step_df.merge(static_features, left_on=['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'], right_index=True)
         grouped_history = history.groupby(level=[0, 1])['cantidad_semanal']
 
-        # Use .map() for fast lookups
         idx = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO']).index
         future_step_df['lag_1'] = idx.map(grouped_history.last())
         future_step_df['lag_2'] = idx.map(grouped_history.nth(-2))
@@ -144,7 +140,6 @@ def convert_df_to_csv(df):
 # --- Sidebar ---
 with st.sidebar:
     st.header("1. Upload Data")
-    # ... (sidebar code unchanged) ...
     st.markdown("Please upload the `INGRESOS` and `EGRESOS` CSV files.")
     uploaded_ingresos_file = st.file_uploader("Upload INGRESOS", type=['csv'])
     uploaded_egresos_file = st.file_uploader("Upload EGRESOS", type=['csv'])
@@ -158,27 +153,59 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
 
     tab1, tab2, tab3 = st.tabs(["📊 Exploratory Data Analysis", "⚙️ Model Training & Evaluation", "📈 Generate Forecast"])
 
-    # ... (Tab 1 and Tab 2 code remains unchanged) ...
     with tab1:
-        #... (Omitted for brevity)...
         st.header("Exploratory Data Analysis")
         st.subheader("Data Previews")
         col1, col2 = st.columns(2)
-        with col1: st.write(f"**INGRESOS:** `{df_ingresos.shape[0]}` rows"); st.dataframe(df_ingresos.head())
-        with col2: st.write(f"**EGRESOS:** `{df_egresos.shape[0]}` rows"); st.dataframe(df_egresos.head())
+        with col1:
+            st.write(f"**INGRESOS (Inflows):** `{df_ingresos.shape[0]}` rows, `{df_ingresos.shape[1]}` columns.")
+            st.dataframe(df_ingresos.head())
+        with col2:
+            st.write(f"**EGRESOS (Outflows):** `{df_egresos.shape[0]}` rows, `{df_egresos.shape[1]}` columns.")
+            st.dataframe(df_egresos.head())
 
         st.sidebar.divider()
         st.sidebar.header("2. Dashboard Filters")
         all_bodegas = sorted(df_demand['BODEGA_ORIGEN_DESC'].unique())
         selected_bodegas = st.sidebar.multiselect('Select Warehouse(s)', options=all_bodegas, default=all_bodegas)
-        if not selected_bodegas: st.warning("Please select at least one warehouse."); st.stop()
+
+        if not selected_bodegas:
+            st.warning("Please select at least one warehouse.")
+            st.stop()
         filtered_demand = df_demand[df_demand['BODEGA_ORIGEN_DESC'].isin(selected_bodegas)]
+
         st.subheader("High-Level Metrics")
-        total_quantity_sold=filtered_demand['CANTIDAD'].sum(); num_unique_skus=filtered_demand['SKU_ALTERNO'].nunique(); start_date=filtered_demand['GENERADA_EL_FECHA_HORA'].min().date(); end_date=filtered_demand['GENERADA_EL_FECHA_HORA'].max().date()
-        kpi1, kpi2, kpi3 = st.columns(3); kpi1.metric("Total Quantity Sold", f"{int(total_quantity_sold):,}"); kpi2.metric("Unique SKUs Sold", f"{num_unique_skus:,}"); kpi3.metric("Date Range", f"{start_date} to {end_date}")
+        total_quantity_sold = filtered_demand['CANTIDAD'].sum()
+        num_unique_skus = filtered_demand['SKU_ALTERNO'].nunique()
+        start_date = filtered_demand['GENERADA_EL_FECHA_HORA'].min().date()
+        end_date = filtered_demand['GENERADA_EL_FECHA_HORA'].max().date()
+
+        kpi1, kpi2, kpi3 = st.columns(3)
+        kpi1.metric("Total Quantity Sold", f"{int(total_quantity_sold):,}")
+        kpi2.metric("Unique SKUs Sold", f"{num_unique_skus:,}")
+        kpi3.metric("Date Range", f"{start_date} to {end_date}")
+
+        st.subheader("Demand Analysis Visualizations")
+        sns.set_style("whitegrid")
+        weekly_demand = filtered_demand.set_index('GENERADA_EL_FECHA_HORA').resample('W')['CANTIDAD'].sum()
+        fig1, ax1 = plt.subplots(figsize=(12, 5))
+        sns.lineplot(data=weekly_demand, ax=ax1, lw=2)
+        ax1.set_title("Total Weekly Demand", fontsize=16)
+        st.pyplot(fig1)
+
+        col_viz1, col_viz2 = st.columns(2)
+        with col_viz1:
+            st.markdown("#### Top 10 Selling Products (SKU)")
+            top_10_skus = filtered_demand.groupby('SKU_ALTERNO')['CANTIDAD'].sum().nlargest(10)
+            fig2, ax2 = plt.subplots(figsize=(8, 6)); sns.barplot(y=top_10_skus.index, x=top_10_skus.values, ax=ax2, palette="viridis"); ax2.set_title("Top 10 SKUs"); st.pyplot(fig2)
+        with col_viz2:
+            st.markdown("#### Top 10 Selling Brands")
+            top_10_brands = filtered_demand.groupby('DESC_MARCA')['CANTIDAD'].sum().nlargest(10)
+            fig3, ax3 = plt.subplots(figsize=(8, 6)); sns.barplot(y=top_10_brands.index, x=top_10_brands.values, ax=ax3, palette="plasma"); ax3.set_title("Top 10 Brands"); st.pyplot(fig3)
 
     with tab2:
         st.header("Model Training and Evaluation")
+        st.markdown("Click the button below to train the forecasting model and evaluate its performance on the last 12 weeks of historical data.")
         if st.button("🚀 Run Model Training & Evaluation", key='train_model'):
             with st.spinner("Processing data and training model..."):
                 df_model_data = create_features(df_demand)
@@ -190,48 +217,58 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
         
         if 'model_trained' in st.session_state:
             st.success("Model training and evaluation complete!")
-            #... (rest of tab 2 omitted for brevity)...
+            st.subheader("Model Performance Metrics")
+            metric_col1, metric_col2 = st.columns(2)
+            metric_col1.metric("MAE", f"{st.session_state['mae']:.2f}")
+            metric_col2.metric("RMSE", f"{st.session_state['rmse']:.2f}")
+            st.info(f"💡 On average, the model's weekly forecast for a single SKU is off by approximately **{st.session_state['mae']:.2f} units**.")
+            
+            st.subheader("Validation: Actual vs. Predicted Sales")
+            actuals_agg = st.session_state['df_results'].groupby('fecha')['actual_sales'].sum()
+            predictions_agg = st.session_state['df_results'].groupby('fecha')['predicted_sales'].sum()
+            fig_val, ax_val = plt.subplots(figsize=(12, 6))
+            ax_val.plot(actuals_agg.index, actuals_agg.values, label='Actual', marker='o')
+            ax_val.plot(predictions_agg.index, predictions_agg.values, label='Predicted', marker='x', linestyle='--')
+            ax_val.set_title('Total Weekly Sales (Validation Set)')
+            ax_val.legend()
+            st.pyplot(fig_val)
+            
+            st.subheader("Model Feature Importance")
+            fig_imp, ax_imp = plt.subplots(figsize=(10, 8))
+            sns.barplot(x='importance', y='feature', data=st.session_state['feat_imp'].head(15), palette='viridis', ax=ax_imp, hue='feature', legend=False)
+            ax_imp.set_title('Top 15 Most Important Features')
+            st.pyplot(fig_imp)
 
     with tab3:
         st.header("Generate Future Forecast")
         if 'model_trained' in st.session_state:
-            
-            # *** NEW: FORECAST SCOPE SELECTION ***
             st.subheader("1. Select Forecast Scope")
             st.markdown("To ensure performance, please select the number of top-selling products (SKUs) you wish to forecast.")
-            
             total_unique_skus = df_demand['SKU_ALTERNO'].nunique()
             
             num_top_skus = st.slider(
                 "Number of Top SKUs to Forecast",
                 min_value=10,
                 max_value=total_unique_skus,
-                value=min(200, total_unique_skus),  # Default to 200 or max available
+                value=min(200, total_unique_skus),
                 step=10
             )
 
             st.subheader("2. Select Forecast Horizon")
             forecast_weeks = st.slider("Forecast Horizon (Weeks)", 4, 52, 12, 1)
             
-            # --- Generate Forecast Button ---
             if st.button("📈 Generate Focused Forecast", key='generate_forecast'):
-                with st.spinner(f"Identifying top {num_top_skus} SKUs and generating forecast... This will be fast!"):
-                    
-                    # 1. Identify top N SKUs based on historical sales
+                with st.spinner(f"Identifying top {num_top_skus} SKUs and generating forecast..."):
                     top_skus = df_demand.groupby('SKU_ALTERNO')['CANTIDAD'].sum().nlargest(num_top_skus).index
-                    
-                    # 2. Filter the feature-engineered data to only these SKUs
                     df_full_data = st.session_state['df_model_data']
                     df_focused_data = df_full_data[df_full_data['SKU_ALTERNO'].isin(top_skus)]
                     
-                    # 3. Retrain final model on the FOCUSED dataset
                     X_full = df_focused_data[st.session_state['features']]
                     y_full = df_focused_data['cantidad_semanal']
                     
                     final_model = lgb.LGBMRegressor(n_estimators=1000, learning_rate=0.05, random_state=42, n_jobs=-1)
                     final_model.fit(X_full, y_full, categorical_feature=st.session_state['cat_features'])
                     
-                    # 4. Generate forecast using the FOCUSED dataset
                     forecast_df = generate_future_forecast(final_model, df_focused_data, forecast_weeks, st.session_state['features'], st.session_state['cat_features'])
                     st.session_state['forecast_df'] = forecast_df
                     st.session_state['df_focused_data_for_plot'] = df_focused_data
@@ -240,14 +277,18 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
                 st.success("Forecast generated successfully!")
                 st.subheader("Historical Sales vs. Future Forecast (Top {} SKUs)".format(num_top_skus))
 
-                # Use the focused data for plotting the historical part
                 hist_agg = st.session_state['df_focused_data_for_plot'].groupby('fecha')['cantidad_semanal'].sum()
                 forecast_agg = st.session_state['forecast_df'].groupby('fecha')['cantidad_semanal'].sum()
                 
-                fig_fc, ax_fc = plt.subplots(figsize=(12, 6)); ax_fc.plot(hist_agg.index, hist_agg.values, label='Historical'); ax_fc.plot(forecast_agg.index, forecast_agg.values, label='Forecasted', linestyle='--', marker='o'); ax_fc.axvline(hist_agg.index.max(), color='red', linestyle=':', label='Forecast Start'); ax_fc.set_title(f'Total Weekly Sales: Historical vs. Forecast for Top {num_top_skus} SKUs'); ax_fc.legend(); st.pyplot(fig_fc)
+                fig_fc, ax_fc = plt.subplots(figsize=(12, 6))
+                ax_fc.plot(hist_agg.index, hist_agg.values, label='Historical')
+                ax_fc.plot(forecast_agg.index, forecast_agg.values, label='Forecasted', linestyle='--', marker='o')
+                ax_fc.axvline(hist_agg.index.max(), color='red', linestyle=':', label='Forecast Start')
+                ax_fc.set_title(f'Total Weekly Sales: Historical vs. Forecast for Top {num_top_skus} SKUs')
+                ax_fc.legend()
+                st.pyplot(fig_fc)
 
                 st.subheader("Forecast Data")
-                #... (rest of tab 3 unchanged) ...
                 forecast_display_cols = ['fecha', 'BODEGA_ORIGEN_DESC', 'SKU_ALTERNO', 'cantidad_semanal']
                 st.dataframe(st.session_state['forecast_df'][forecast_display_cols])
                 st.download_button("📥 Download Forecast as CSV", convert_df_to_csv(st.session_state['forecast_df']), f"weekly_forecast_{num_top_skus}_skus_{forecast_weeks}_weeks.csv", 'text/csv')
@@ -255,7 +296,8 @@ if uploaded_ingresos_file is not None and uploaded_egresos_file is not None:
             st.info("Please train a model in the 'Model Training & Evaluation' tab first.")
 
 else:
-    st.markdown("... (unchanged) ...")
+    st.markdown("This application provides a comprehensive analysis and forecast of product demand. **To begin, please upload your data files using the sidebar on the left.**")
+    st.info("Awaiting CSV file uploads...")
 
 st.sidebar.divider()
 st.sidebar.markdown("**Developed by:**  \nAntonio Medrano  \n*Data Scientist, CepSA*")
