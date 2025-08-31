@@ -109,6 +109,9 @@ def generate_future_forecast(_final_model, _df_model_data, forecast_weeks, _feat
     identifiers = history.index.unique()
     future_df_list = []
     
+    # Define which columns are numerical features that might need filling
+    numeric_feature_cols = ['lag_1', 'lag_2', 'lag_4', 'lag_52', 'rolling_mean_4']
+    
     for date in pd.date_range(start=history['fecha'].max() + pd.Timedelta(weeks=1), periods=forecast_weeks, freq='W'):
         future_step_df = pd.DataFrame(index=identifiers).reset_index()
         future_step_df['fecha'] = date
@@ -124,7 +127,11 @@ def generate_future_forecast(_final_model, _df_model_data, forecast_weeks, _feat
         future_step_df['lag_52'] = idx.map(grouped_history.nth(-52))
         future_step_df['rolling_mean_4'] = idx.map(grouped_history.rolling(4).mean().groupby(level=[0, 1]).last())
 
-        future_step_df.fillna(0, inplace=True)
+        # *** FIX IS HERE: Only fill NaNs in the specific numeric feature columns ***
+        for col in numeric_feature_cols:
+            if col in future_step_df.columns:
+                future_step_df[col].fillna(0, inplace=True)
+        
         predictions = _final_model.predict(future_step_df[_features])
         future_step_df['cantidad_semanal'] = np.maximum(0, predictions)
         new_history_row = future_step_df.set_index(['BODEGA_ORIGEN_DESC', 'SKU_ALTERNO'])
